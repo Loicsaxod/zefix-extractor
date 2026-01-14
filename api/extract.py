@@ -1,6 +1,7 @@
 """
 API Serverless pour extraire les données ZEFIX
 Compatible avec Vercel Serverless Functions
+Version corrigée - Extraction réelle des données
 """
 
 from http.server import BaseHTTPRequestHandler
@@ -17,8 +18,8 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             # Lire le body
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length) if content_length > 0 else b'{}'
             data = json.loads(post_data.decode('utf-8'))
             
             cantons = data.get('cantons', ['GE', 'VD'])
@@ -52,11 +53,13 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_response(500)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             
             error_response = {
                 'success': False,
-                'error': str(e)
+                'error': str(e),
+                'type': type(e).__name__
             }
             
             self.wfile.write(json.dumps(error_response).encode('utf-8'))
@@ -73,44 +76,59 @@ class handler(BaseHTTPRequestHandler):
         """Extraire les données depuis l'API ZEFIX"""
         entreprises = []
         
-        # Date de début
+        # Date de début (format YYYY-MM-DD)
         date_from = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
         
-        # API ZEFIX publique
-        api_url = "https://www.zefix.admin.ch/ZefixPublicREST/api/v1/shab/search"
+        # API ZEFIX publique - endpoint correct
+        base_url = "https://www.zefix.admin.ch/ZefixPublicREST/api/v1/firm/search.json"
         
         for canton in cantons:
-            # Recherche par canton
+            print(f"Extraction canton {canton}...")
+            
+            # Paramètres de recherche
             params = {
+                'name': '',  # Vide = toutes les entreprises
                 'canton': canton,
-                'registrationDateFrom': date_from,
-                'legalForms': ['0106', '0107', '0108'],  # SA, Sàrl, EI
-                'page': 0,
-                'pageSize': 100
+                'activeOnly': 'false',
+                'deleteDate': '',
+                'registryOfCommerceId': '',
+                'legalSeat': ''
             }
             
             try:
-                response = requests.get(api_url, params=params, timeout=30)
+                # Requête à l'API
+                response = requests.get(base_url, params=params, timeout=30)
                 
                 if response.status_code == 200:
                     data = response.json()
                     
-                    for item in data.get('list', []):
-                        # Extraire les informations
-                        entreprise = {
-                            'nom': item.get('name', ''),
-                            'forme_juridique': self.get_forme_juridique(item.get('legalForm', '')),
-                            'canton': canton,
-                            'ville': item.get('city', ''),
-                            'npa': item.get('zipCode', ''),
-                            'adresse': item.get('address', ''),
-                            'date_inscription': item.get('registrationDate', ''),
-                            'uid': item.get('uid', ''),
-                            'numero_rc': item.get('registerNumber', '')
-                        }
-                        
-                        entreprises.append(entreprise)
-                        
+                    # Parser les résultats
+                    if 'list' in data:
+                        for item in data['list']:
+                            # Filtrer par date d'inscription
+                            date_str = item.get('inscription', {}).get('date', '')
+                            if date_str and date_str >= date_from:
+                                # Extraire les informations
+                                forme = self.get_forme_juridique(item.get('legalForm', ''))
+                                
+                                # Filtrer uniquement SA, Sàrl, EI
+                                if forme in ['SA', 'Sàrl', 'EI']:
+                                    entreprise = {
+                                        'nom': item.get('name', ''),
+                                        'forme_juridique': forme,
+                                        'canton': canton,
+                                        'ville': item.get('address', {}).get('city', ''),
+                                        'npa': item.get('address', {}).get('swissZipCode', ''),
+                                        'adresse': self.format_adresse(item.get('address', {})),
+                                        'date_inscription': date_str,
+                                        'uid': item.get('uid', ''),
+                                        'numero_rc': item.get('chId', '')
+                                    }
+                                    
+                                    entreprises.append(entreprise)
+                    
+                    print(f"Canton {canton}: {len([e for e in entreprises if e['canton'] == canton])} entreprises trouvées")
+                                    
             except Exception as e:
                 print(f"Erreur canton {canton}: {e}")
                 continue
@@ -118,16 +136,36 @@ class handler(BaseHTTPRequestHandler):
         # Trier par priorité
         entreprises = self.prioritize(entreprises)
         
+        print(f"Total: {len(entreprises)} entreprises")
+        
         return entreprises
     
-    def get_forme_juridique(self, code):
+    def format_adresse(self, address):
+        """Formater l'adresse complète"""
+        parts = []
+        
+        if address.get('street'):
+            parts.append(address['street'])
+        if address.get('houseNumber'):
+            if parts:
+                parts[-1] += f" {address['houseNumber']}"
+            else:
+                parts.append(address['houseNumber'])
+        
+        return ' '.join(parts) if parts else ''
+    
+    def get_forme_juridique(self, legal_form):
         """Convertir le code en forme juridique"""
-        mapping = {
-            '0106': 'SA',
-            '0107': 'Sàrl',
-            '0108': 'EI'
-        }
-        return mapping.get(code, 'Autre')
+        legal_form_str = str(legal_form).lower()
+        
+        if 'sa' in legal_form_str or 'aktiengesellschaft' in legal_form_str or '0106' in legal_form_str:
+            return 'SA'
+        elif 'sàrl' in legal_form_str or 'sarl' in legal_form_str or 'gmbh' in legal_form_str or '0107' in legal_form_str:
+            return 'Sàrl'
+        elif 'individuel' in legal_form_str or 'einzelfirma' in legal_form_str or '0108' in legal_form_str:
+            return 'EI'
+        else:
+            return 'Autre'
     
     def prioritize(self, entreprises):
         """Prioriser par forme juridique"""
@@ -140,13 +178,6 @@ class handler(BaseHTTPRequestHandler):
         wb = Workbook()
         ws = wb.active
         ws.title = "Nouvelles Entreprises"
-        
-        # Couleurs
-        colors = {
-            'SA': 'FFCCCC',
-            'Sàrl': 'FFE5CC',
-            'EI': 'FFFFCC'
-        }
         
         # En-têtes
         headers = [
@@ -165,7 +196,6 @@ class handler(BaseHTTPRequestHandler):
         
         # Données
         for row_idx, ent in enumerate(entreprises, 2):
-            # Priorité
             priorite = 'Haute' if ent['forme_juridique'] == 'SA' else 'Moyenne' if ent['forme_juridique'] == 'Sàrl' else 'Basse'
             
             row_data = [
@@ -177,13 +207,13 @@ class handler(BaseHTTPRequestHandler):
                 ent['npa'],
                 ent['adresse'],
                 ent['date_inscription'],
-                '',  # Téléphone
-                '',  # Email
-                '',  # Site web
-                '',  # LinkedIn
-                'Nouveau',  # Statut
-                '',  # Notes
-                '',  # Date dernier contact
+                '',
+                '',
+                '',
+                '',
+                'Nouveau',
+                '',
+                '',
                 ent['numero_rc'],
                 ent['uid']
             ]
@@ -192,7 +222,6 @@ class handler(BaseHTTPRequestHandler):
                 cell = ws.cell(row=row_idx, column=col_idx)
                 cell.value = value
                 
-                # Couleur priorité
                 if col_idx == 1 and priorite in ['Haute', 'Moyenne', 'Basse']:
                     color_map = {'Haute': 'FFCCCC', 'Moyenne': 'FFE5CC', 'Basse': 'FFFFCC'}
                     cell.fill = PatternFill(start_color=color_map[priorite], 
