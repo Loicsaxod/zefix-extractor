@@ -87,7 +87,7 @@ class handler(BaseHTTPRequestHandler):
             
             # Paramètres de recherche
             params = {
-                'name': '',  # Vide = toutes les entreprises
+                'name': '',
                 'canton': canton,
                 'activeOnly': 'false',
                 'deleteDate': '',
